@@ -1200,10 +1200,19 @@ const firebaseConfig = {
   appId: "1:706520531855:web:a50634e36e258cf48b41fa"
 };
 
-window.App = new App(firebaseConfig);
-window.Modal = Modal;
-window.ThemeManager = ThemeManager;
-App.init();
+try{
+  if(typeof firebase === 'undefined'){
+    throw new Error('Firebase library failed to load — check your internet connection or try switching from mobile data to WiFi.');
+  }
+  window.App = new App(firebaseConfig);
+  window.Modal = Modal;
+  window.ThemeManager = ThemeManager;
+  App.init();
+}catch(e){
+  document.getElementById('loginErr').textContent = 'Failed to start: ' + e.message;
+  document.getElementById('loginErr').style.display = 'block';
+  console.error('App init failed:', e);
+}
 </script>
 </body>
 </html>
