@@ -1103,26 +1103,35 @@ class Router {
 
   buildNav(){
     const nav = document.getElementById('navList');
-    nav.innerHTML = '';
-    Router.NAV.forEach(group=>{
-      const visibleItems = group.items.filter(i=>i.roles.includes(this.app.currentUser.role));
-      if(!visibleItems.length) return;
-      const sect = document.createElement('div');
-      sect.className = 'nav-sect';
-      sect.textContent = group.section;
-      nav.appendChild(sect);
-      const wrap = document.createElement('div');
-      wrap.className = 'nav';
-      visibleItems.forEach(item=>{
-        const b = document.createElement('button');
-        b.id = 'nav-'+item.id;
-        b.innerHTML = `${Icons.svg(item.icon,17)} ${item.label}`;
-        b.onclick = () => this.navigate(item.id);
-        wrap.appendChild(b);
+    try{
+      nav.innerHTML = '';
+      let itemCount = 0;
+      Router.NAV.forEach(group=>{
+        const visibleItems = group.items.filter(i=>i.roles.includes(this.app.currentUser.role));
+        if(!visibleItems.length) return;
+        const sect = document.createElement('div');
+        sect.className = 'nav-sect';
+        sect.textContent = group.section;
+        nav.appendChild(sect);
+        const wrap = document.createElement('div');
+        wrap.className = 'nav';
+        visibleItems.forEach(item=>{
+          const b = document.createElement('button');
+          b.id = 'nav-'+item.id;
+          b.innerHTML = `${Icons.svg(item.icon,17)} ${item.label}`;
+          b.onclick = () => this.navigate(item.id);
+          wrap.appendChild(b);
+          itemCount++;
+        });
+        nav.appendChild(wrap);
       });
-      nav.appendChild(wrap);
-    });
-    Icons.refresh();
+      Icons.refresh();
+      if(itemCount === 0){
+        nav.innerHTML = '<div style="color:#fff;padding:12px;font-size:12px">DEBUG: 0 nav items matched role "'+this.app.currentUser.role+'"</div>';
+      }
+    }catch(e){
+      nav.innerHTML = '<div style="color:#fff;background:#a00;padding:12px;border-radius:8px;font-size:12px;white-space:pre-wrap">DEBUG buildNav error: '+e.message+'</div>';
+    }
   }
 
   navigate(pageId){
