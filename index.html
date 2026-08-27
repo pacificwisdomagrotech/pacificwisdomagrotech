@@ -6,6 +6,7 @@
 <title>Pacific Wisdom Agrotech — ERP</title>
 <link rel="manifest" href="./manifest.json">
 <meta name="theme-color" content="#0b6b3a">
+<meta name="color-scheme" content="light dark">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
@@ -47,7 +48,8 @@
 }
 
 *{box-sizing:border-box}
-html{-webkit-tap-highlight-color:transparent}
+html{-webkit-tap-highlight-color:transparent;color-scheme:light}
+html[data-theme="dark"]{color-scheme:dark}
 body{margin:0;font-family:'Inter',system-ui,sans-serif;color:var(--text);background:var(--bg);letter-spacing:-.01em}
 h1,h2,h3,.brand,.stat-num,.hero-title{font-family:'Sora',system-ui,sans-serif}
 .mono{font-family:'JetBrains Mono',monospace}
