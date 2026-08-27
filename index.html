@@ -1153,7 +1153,7 @@ class Router {
 }
 
 /* -------------------------- 8. APP (composition root) -------------------------- */
-class App {
+class ERPApplication {
   constructor(firebaseConfig){
     this.fb = new FirebaseService(firebaseConfig);
     this.currentUser = null;
@@ -1204,10 +1204,10 @@ try{
   if(typeof firebase === 'undefined'){
     throw new Error('Firebase library failed to load — check your internet connection or try switching from mobile data to WiFi.');
   }
-  window.App = new App(firebaseConfig);
+  window.App = new ERPApplication(firebaseConfig);
   window.Modal = Modal;
   window.ThemeManager = ThemeManager;
-  App.init();
+  window.App.init();
 }catch(e){
   document.getElementById('loginErr').textContent = 'Failed to start: ' + e.message;
   document.getElementById('loginErr').style.display = 'block';
