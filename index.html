@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Pacific Wisdom Agrotech — ERP</title>
 <link rel="manifest" href="./manifest.json">
+<link rel="icon" href="./icon-192.png">
+<link rel="apple-touch-icon" href="./icon-192.png">
 <meta name="theme-color" content="#0b6b3a">
 <meta name="color-scheme" content="light dark">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -208,7 +210,7 @@ tbody tr:hover{background:color-mix(in srgb, var(--card) 70%, var(--bg))}
   </div>
 
   <div class="login-panel">
-    <div class="login-card">
+    <div class="login-card" id="loginCard">
       <h2>Sign in</h2>
       <p class="muted" style="margin-top:0">Enter your ERP account details</p>
 
@@ -225,6 +227,15 @@ tbody tr:hover{background:color-mix(in srgb, var(--card) 70%, var(--bg))}
         <button class="btn btn-primary" onclick="App.auth.verifyOtp()">Verify & Continue</button>
         <div class="err" id="otpErr"></div>
       </div>
+    </div>
+
+    <div class="login-card" id="lockCard" style="display:none;text-align:center">
+      <div class="brand-mark" style="background:var(--p-soft);color:var(--p);width:60px;height:60px;border-radius:16px;margin:0 auto 18px;font-size:26px">🔒</div>
+      <h2 id="lockName">Welcome back</h2>
+      <p class="muted">Unlock with your fingerprint or face to continue.</p>
+      <button class="btn btn-primary" onclick="App.auth.unlockWithBiometric()">Unlock</button>
+      <button class="btn btn-ghost btn-small" style="width:100%;margin-top:10px" onclick="App.auth.logout()">Use password instead</button>
+      <div class="err" id="lockErr"></div>
     </div>
   </div>
 </div>
@@ -541,9 +552,90 @@ class NotificationCenter {
   }
 }
 
-/* -------------------------- 5. AUTH CONTROLLER -------------------------- */
+/* -------------------------- 5. BIOMETRIC LOCK -------------------------- */
+/** Local device convenience lock using WebAuthn (fingerprint/face). This does
+ *  NOT replace Firebase Auth — it only gates the already-restored Firebase
+ *  session behind a biometric check on this specific device, the same way a
+ *  banking app's "unlock with fingerprint" works after you're already
+ *  signed in. Each device that enables it stores its own credential id. */
+class BiometricLock {
+  static isSupported(){ return !!(window.PublicKeyCredential && navigator.credentials); }
+  static isEnabled(uid){ return !!localStorage.getItem('pw_biometric_'+uid); }
+
+  static async enroll(uid, name, email){
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const userId = crypto.getRandomValues(new Uint8Array(16));
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        challenge, rp: { name: 'Pacific Wisdom Agrotech' },
+        user: { id: userId, name: email, displayName: name },
+        pubKeyCredParams: [{ type:'public-key', alg:-7 }, { type:'public-key', alg:-257 }],
+        authenticatorSelection: { authenticatorAttachment:'platform', userVerification:'required' },
+        timeout: 60000, attestation: 'none'
+      }
+    });
+    localStorage.setItem('pw_biometric_'+uid, JSON.stringify({ credId: BiometricLock._bufToB64(cred.rawId) }));
+  }
+
+  static async verify(uid){
+    const stored = JSON.parse(localStorage.getItem('pw_biometric_'+uid));
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    await navigator.credentials.get({
+      publicKey: {
+        challenge,
+        allowCredentials: [{ id: BiometricLock._b64ToBuf(stored.credId), type:'public-key' }],
+        userVerification: 'required', timeout: 60000
+      }
+    });
+    return true; // navigator.credentials.get() throws/rejects on failure or cancel
+  }
+
+  static disable(uid){ localStorage.removeItem('pw_biometric_'+uid); }
+
+  static _bufToB64(buf){ return btoa(String.fromCharCode(...new Uint8Array(buf))); }
+  static _b64ToBuf(b64){ return Uint8Array.from(atob(b64), c=>c.charCodeAt(0)).buffer; }
+}
+
+/* -------------------------- 6. AUTH CONTROLLER -------------------------- */
 class AuthController {
-  constructor(app){ this.app = app; this.pendingUser = null; }
+  constructor(app){ this.app = app; this.pendingUser = null; this._restoring = true; }
+
+  /** Called once at startup. Firebase keeps sessions in IndexedDB by default,
+   *  so a page refresh does NOT actually log the person out — the app just
+   *  never checked for the existing session before. This fixes that. */
+  listenForSessionRestore(){
+    this.app.fb.auth.onAuthStateChanged(async (user) => {
+      if(!this._restoring) return; // ignore events after explicit login/logout already handled them
+      this._restoring = false;
+      if(!user){ return; } // no session — normal login screen stays visible
+      const udoc = await this.app.fb.db.collection('users').doc(user.uid).get();
+      if(!udoc.exists) return;
+      const userData = { uid: user.uid, ...udoc.data() };
+      if(BiometricLock.isEnabled(user.uid)){
+        this._showLockScreen(userData);
+      } else {
+        await this._completeLogin(user.uid);
+      }
+    });
+  }
+
+  _showLockScreen(userData){
+    this._lockedUser = userData;
+    document.getElementById('loginCard').style.display = 'none';
+    document.getElementById('lockCard').style.display = 'block';
+    document.getElementById('lockName').textContent = `Welcome back, ${userData.name}`;
+  }
+
+  async unlockWithBiometric(){
+    const errEl = document.getElementById('lockErr');
+    errEl.style.display = 'none';
+    try{
+      await BiometricLock.verify(this._lockedUser.uid);
+      await this._completeLogin(this._lockedUser.uid);
+    }catch(e){
+      this._showErr(errEl, 'Could not verify — try again, or use your password.');
+    }
+  }
 
   async login(){
     const email = document.getElementById('loginEmail').value.trim();
@@ -552,6 +644,7 @@ class AuthController {
     errEl.style.display = 'none';
     if(!email || !password){ this._showErr(errEl, 'Enter email and password.'); return; }
     try{
+      this._restoring = false; // explicit login path — session-restore listener should stand down
       const cred = await this.app.fb.auth.signInWithEmailAndPassword(email, password);
       this.pendingUser = cred.user;
       const udoc = await this.app.fb.db.collection('users').doc(cred.user.uid).get();
@@ -604,8 +697,11 @@ class AuthController {
   logout(){
     this.app.fb.auth.signOut();
     this.app.currentUser = null;
+    this._restoring = false;
     document.getElementById('appShell').style.display = 'none';
     document.getElementById('loginScreen').style.display = 'grid';
+    document.getElementById('loginCard').style.display = 'block';
+    document.getElementById('lockCard').style.display = 'none';
     document.getElementById('loginStep').style.display = 'block';
     document.getElementById('otpStep').style.display = 'none';
     document.getElementById('loginEmail').value = '';
@@ -1033,6 +1129,20 @@ class SettingsPage extends Page {
       <div class="settings-row"><div class="txt"><b>Enquiry notifications</b></div><div class="toggle ${SettingsStore.get('notifEnquiry',true)?'on':''}" onclick="App.pages.settings.toggle(this,'notifEnquiry')"></div></div>
       <div class="settings-row"><div class="txt"><b>Daily sales summary email</b><span class="muted">Needs a small backend (Firebase Functions) to send on a schedule — not yet wired up</span></div><div class="toggle" style="opacity:.4;pointer-events:none"></div></div>
     </div>
+    <div class="card" style="margin-bottom:16px">
+      <div class="section-title">${Icons.svg('fingerprint',18)} Biometric Unlock</div>
+      <p class="muted">${BiometricLock.isSupported()
+        ? (BiometricLock.isEnabled(this.user.uid)
+            ? 'Enabled on this device — reopening the app will ask for your fingerprint or face instead of your password.'
+            : 'Skip typing your password on this device — unlock with your fingerprint or face instead.')
+        : 'Not supported on this browser/device.'}</p>
+      ${BiometricLock.isSupported() ? (
+        BiometricLock.isEnabled(this.user.uid)
+          ? `<button class="btn btn-danger btn-small" onclick="App.pages.settings.disableBiometric()">Disable on this device</button>`
+          : `<button class="btn btn-primary btn-small" onclick="App.pages.settings.enableBiometric()">Enable on this device</button>`
+      ) : ''}
+      <div id="bio-err" class="err" style="margin-top:10px"></div>
+    </div>
     <div class="card">
       <div class="section-title">${Icons.svg('shield-check',18)} Two-Factor Authentication</div>
       <p class="muted">${this.user.twoFAEnabled ? 'Enabled on your account.' : 'Add an authenticator-app code at login for extra security.'}</p>
@@ -1041,6 +1151,21 @@ class SettingsPage extends Page {
         : `<button class="btn btn-primary btn-small" onclick="App.pages.settings.start2FA()">Enable 2FA</button>`}
       <div id="twofa-setup"></div>
     </div>`;
+  }
+  async enableBiometric(){
+    const errEl = document.getElementById('bio-err');
+    errEl.style.display = 'none';
+    try{
+      await BiometricLock.enroll(this.user.uid, this.user.name, this.user.email);
+      this.app.router.render();
+    }catch(e){
+      errEl.textContent = 'Could not set up biometric unlock: ' + e.message;
+      errEl.style.display = 'block';
+    }
+  }
+  disableBiometric(){
+    BiometricLock.disable(this.user.uid);
+    this.app.router.render();
   }
   toggle(el, key){
     const on = !el.classList.contains('on');
@@ -1193,6 +1318,7 @@ class ERPApplication {
     ThemeManager.init();
     this.notifications.requestPermissionOnFirstClick();
     Icons.refresh();
+    this.auth.listenForSessionRestore();
   }
 }
 
