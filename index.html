@@ -1219,6 +1219,11 @@ try{
   window.Modal = Modal;
   window.ThemeManager = ThemeManager;
   window.App.init();
+  if('serviceWorker' in navigator){
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./sw.js').catch(err => console.error('SW registration failed:', err));
+    });
+  }
 }catch(e){
   document.getElementById('loginErr').textContent = 'Failed to start: ' + e.message;
   document.getElementById('loginErr').style.display = 'block';
