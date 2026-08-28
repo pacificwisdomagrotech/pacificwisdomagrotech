@@ -14,8 +14,8 @@ see the same live data from any phone/desktop. Follow these steps once.
 4. Click the gear icon → **Project settings** → scroll to "Your apps" →
    click the `</>` (web) icon → register an app (any nickname) → copy the
    `firebaseConfig` object it gives you.
-5. Open `index.html`, find the `firebaseConfig = {...}` block near the top
-   of the `<script>` section, and paste your real values in.
+5. Open `js/firebase-config.js` and paste your real values into the
+   `firebaseConfig = {...}` block.
 
 ## 2. Set Firestore security rules
 
@@ -61,6 +61,54 @@ The app now models a real 3-tier crop trading flow:
 4. **Manager sells to a customer** at the fixed retail rate — the app tells them exactly how much to collect, and automatically calculates your 20% profit-share on the wholesale-to-retail margin. You get a popup notification with your share the moment it happens.
 5. **Manager marks paid → you acknowledge** — same payment-confirmation loop as before.
 
+## File map — where to look when something needs changing
+
+The app is now split by feature instead of one giant file. Structure:
+
+```
+index.html                          — page markup only (login screen, app shell, modal)
+css/styles.css                      — all visual styling, themes, layout
+manifest.json, sw.js                — PWA install + offline shell
+icon-*.png                          — app icons
+
+js/firebase-config.js               — YOUR Firebase project keys (the only file to
+                                       touch for initial setup / switching projects)
+js/app.js                           — wires everything together + starts the app
+
+js/core/services.js                 — Firebase wrapper, 2FA (TOTP), themes, WhatsApp
+                                       links, Excel export, PDF generation, stock
+                                       transactions (StockService)
+js/core/store.js                    — DataStore (all Firestore data + listeners),
+                                       ActivityLogger
+js/core/notifications-biometric.js  — in-app notification bell, biometric unlock
+js/core/auth.js                     — login, 2FA verification, session restore, logout
+js/core/router.js                   — sidebar navigation + page switching
+
+js/pages/base.js                    — shared base class every page extends
+js/pages/dashboard.js               — Dashboard
+js/pages/enquiries.js               — Enquiries
+js/pages/products.js                — Products & Rates (wholesale + retail)
+js/pages/purchases.js               — Farmer Purchases
+js/pages/orders.js                  — Orders (manager places, admin approves)
+js/pages/sales.js                   — Sales & Profit-Share
+js/pages/crm.js                     — Farmers & Customers (shared CrmPage class)
+js/pages/inventory.js               — Warehouse Stock
+js/pages/users.js                   — Manage Managers
+js/pages/activity.js                — Activity Log
+js/pages/reports.js                 — Reports, Excel export, income/expense chart
+js/pages/settings.js                — Theme, notifications, 2FA, biometric unlock
+```
+
+**Uploading changes:** each file above is independent — when I hand you an updated
+file, only that one needs re-uploading to the matching path in your GitHub repo
+(e.g. an Orders fix only needs `js/pages/orders.js` re-uploaded, not the whole app).
+GitHub's "Add file" screen lets you type the full path (like `js/pages/orders.js`)
+directly into the filename box — it creates the folders automatically if they don't
+exist yet.
+
+**First-time upload:** all 23 files need to go up once, preserving this exact folder
+structure, before the site will work.
+
 ## 3. Create your first Admin account
 
 The app can't create the very first admin (nobody's logged in yet), so do it
@@ -93,8 +141,12 @@ password hints, as required.
 ## 5. Publish on GitHub Pages
 
 1. Create a new GitHub repo, e.g. `pw-agrotech-erp`.
-2. Upload `index.html`, `manifest.json`, and `sw.js` to the repo root
-   (GitHub mobile app → Add file → Upload works fine here).
+2. Upload all 23 files, preserving the folder structure shown in the file
+   map above (`index.html` and `manifest.json` at the repo root, everything
+   else under `css/`, `js/core/`, `js/pages/`, and `icon-*.png` at root).
+   GitHub's "Add file" screen lets you type a full path like
+   `js/pages/orders.js` into the filename box — it creates folders
+   automatically.
 3. Repo → **Settings > Pages** → Source: `Deploy from a branch` → Branch:
    `main` / root → Save.
 4. Your ERP will be live at `https://<your-username>.github.io/pw-agrotech-erp/`
