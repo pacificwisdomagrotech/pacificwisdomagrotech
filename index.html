@@ -288,6 +288,7 @@ tbody tr:hover{background:color-mix(in srgb, var(--card) 70%, var(--bg))}
 <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-firestore.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
 <script src="https://unpkg.com/lucide@latest"></script>
 
 <script>
@@ -438,6 +439,106 @@ class Modal {
   static close(){ document.getElementById('modalBg').style.display='none'; }
 }
 
+/** Builds a simple order-summary PDF client-side (jsPDF) and returns it as a
+ *  data URL so it can be stored on the order document — the manager can then
+ *  download it from inside the app itself, no email/WhatsApp needed. */
+class PdfService {
+  static generateOrderSummary(order){
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF();
+    const amount = order.qty * order.adminRate;
+    doc.setFontSize(16); doc.text('Pacific Wisdom Agrotech', 14, 18);
+    doc.setFontSize(11); doc.text('Order Summary', 14, 26);
+    doc.setLineWidth(0.5); doc.line(14, 30, 196, 30);
+    const rows = [
+      ['Order ID', order.id || '-'],
+      ['Date', new Date().toLocaleDateString('en-IN')],
+      ['Manager', order.managerName],
+      ['Product', order.product],
+      ['Quantity', order.qty + ' quintal'],
+      ['Wholesale Rate', '₹' + order.adminRate + ' / quintal'],
+      ['Total Amount', '₹' + amount.toLocaleString('en-IN')],
+      ['Status', 'Approved'],
+    ];
+    let y = 42;
+    rows.forEach(([label, value])=>{
+      doc.setFont(undefined,'bold'); doc.text(label + ':', 14, y);
+      doc.setFont(undefined,'normal'); doc.text(String(value), 70, y);
+      y += 9;
+    });
+    doc.setFontSize(9); doc.setTextColor(120);
+    doc.text('Generated automatically by the PW Agrotech ERP.', 14, y+10);
+    return doc.output('datauristring');
+  }
+  static download(dataUrl, filename){
+    const a = document.createElement('a');
+    a.href = dataUrl; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+}
+
+/** Every stock movement (farmer purchase, admin→manager transfer, manager
+ *  sale) goes through here as a Firestore transaction, so two people acting
+ *  at the same moment can never desync the numbers. */
+class StockService {
+  constructor(db){ this.db = db; }
+
+  /** Admin buys from a farmer: adds straight into admin's central inventory. */
+  async recordFarmerPurchase({ farmerName, phone, product, qty, rate, createdBy }){
+    const amount = qty * rate;
+    await this.db.collection('farmerPurchases').add({
+      farmerName, phone: phone||'', product, qty, rate, amount,
+      createdBy, createdAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+    await this.db.runTransaction(async (tx) => {
+      const invRef = this.db.collection('inventory');
+      const snap = await invRef.where('product','==',product).limit(1).get();
+      if(snap.empty){
+        tx.set(invRef.doc(), { product, qty, unit:'quintal' });
+      } else {
+        const doc = snap.docs[0];
+        tx.update(doc.ref, { qty: (doc.data().qty||0) + qty });
+      }
+    });
+  }
+
+  /** Admin approves a manager's order: moves stock from admin inventory into
+   *  that manager's stock ledger. Throws if admin doesn't have enough. */
+  async transferToManager({ product, qty, managerId, managerName }){
+    await this.db.runTransaction(async (tx) => {
+      const invSnap = await this.db.collection('inventory').where('product','==',product).limit(1).get();
+      if(invSnap.empty || (invSnap.docs[0].data().qty||0) < qty){
+        throw new Error(`Not enough ${product} in stock to approve this order.`);
+      }
+      const invDoc = invSnap.docs[0];
+      tx.update(invDoc.ref, { qty: invDoc.data().qty - qty });
+
+      const stockSnap = await this.db.collection('managerStock')
+        .where('managerId','==',managerId).where('product','==',product).limit(1).get();
+      if(stockSnap.empty){
+        tx.set(this.db.collection('managerStock').doc(), { managerId, managerName, product, qty });
+      } else {
+        const sDoc = stockSnap.docs[0];
+        tx.update(sDoc.ref, { qty: sDoc.data().qty + qty });
+      }
+    });
+  }
+
+  /** Manager sells to a customer: deducts from that manager's stock ledger.
+   *  Throws if they don't have enough on hand. */
+  async deductManagerStock({ managerId, product, qty }){
+    await this.db.runTransaction(async (tx) => {
+      const stockSnap = await this.db.collection('managerStock')
+        .where('managerId','==',managerId).where('product','==',product).limit(1).get();
+      if(stockSnap.empty || (stockSnap.docs[0].data().qty||0) < qty){
+        throw new Error(`You only have ${stockSnap.empty ? 0 : stockSnap.docs[0].data().qty} qtl of ${product} in stock.`);
+      }
+      const sDoc = stockSnap.docs[0];
+      tx.update(sDoc.ref, { qty: sDoc.data().qty - qty });
+    });
+  }
+}
+
 /* -------------------------- 3. DATA STORE -------------------------- */
 
 /** Single source of truth for all Firestore collections. Pages read from
@@ -450,18 +551,25 @@ class DataStore {
     this.activity = activity;
     this.products = []; this.enquiries = []; this.orders = []; this.sales = [];
     this.farmers = []; this.customers = []; this.inventory = []; this.users = [];
-    this.activityLog = [];
-    this._onChange = null; // set by App to trigger a re-render of the active page
+    this.activityLog = []; this.managerStock = []; this.farmerPurchases = [];
+    this._onChange = null;   // set by App to trigger a re-render of the active page
+    this.onNewOrder = null;  // set by App: fires (order) => ... when a fresh order needs admin's attention
+    this.onNewSale = null;   // set by App: fires (sale) => ... when a fresh sale needs admin's attention
   }
   onChange(cb){ this._onChange = cb; }
   _notifyIfRelevant(pages){ if(this._onChange) this._onChange(pages); }
+
+  /** Find (or return null for) a manager's stock row for one product. */
+  stockFor(managerId, product){
+    return this.managerStock.find(m => m.managerId===managerId && m.product===product);
+  }
 
   attach(currentUser){
     const db = this.fb.db;
 
     db.collection('products').onSnapshot(s=>{
       this.products = s.docs.map(d=>({id:d.id,...d.data()}));
-      this._notifyIfRelevant(['products','dashboard','orders']);
+      this._notifyIfRelevant(['products','dashboard','orders','sales']);
     });
 
     db.collection('enquiries').orderBy('createdAt','desc').onSnapshot(s=>{
@@ -478,17 +586,25 @@ class DataStore {
       this.orders = s.docs.map(d=>({id:d.id,...d.data()}));
       if(prev && this.orders.length > prev && SettingsStore.get('notifOrder', true)){
         this.notifications.push('New order placed', this.orders[0].product+' × '+this.orders[0].qty+' qtl');
+        if(currentUser.role==='admin' && this.orders[0].status==='placed' && this.onNewOrder) this.onNewOrder(this.orders[0]);
       }
       this._notifyIfRelevant(['orders','dashboard','sales']);
     });
 
     db.collection('sales').orderBy('createdAt','desc').onSnapshot(s=>{
+      const prev = this.sales.length;
       this.sales = s.docs.map(d=>({id:d.id,...d.data()}));
+      if(prev && this.sales.length > prev && currentUser.role==='admin' && this.sales[0].profitShare>0){
+        this.notifications.push('New sale recorded', `${this.sales[0].managerName} sold ${this.sales[0].qty} qtl ${this.sales[0].product} — your share ₹${this.sales[0].profitShare.toLocaleString('en-IN')}`);
+        if(this.onNewSale) this.onNewSale(this.sales[0]);
+      }
       this._notifyIfRelevant(['sales','dashboard','reports']);
     });
-    db.collection('farmers').onSnapshot(s=>{ this.farmers = s.docs.map(d=>({id:d.id,...d.data()})); this._notifyIfRelevant(['farmers']); });
+    db.collection('farmers').onSnapshot(s=>{ this.farmers = s.docs.map(d=>({id:d.id,...d.data()})); this._notifyIfRelevant(['farmers','purchases']); });
     db.collection('customers').onSnapshot(s=>{ this.customers = s.docs.map(d=>({id:d.id,...d.data()})); this._notifyIfRelevant(['customers']); });
-    db.collection('inventory').onSnapshot(s=>{ this.inventory = s.docs.map(d=>({id:d.id,...d.data()})); this._notifyIfRelevant(['inventory','dashboard']); });
+    db.collection('inventory').onSnapshot(s=>{ this.inventory = s.docs.map(d=>({id:d.id,...d.data()})); this._notifyIfRelevant(['inventory','dashboard','purchases']); });
+    db.collection('managerStock').onSnapshot(s=>{ this.managerStock = s.docs.map(d=>({id:d.id,...d.data()})); this._notifyIfRelevant(['sales','dashboard']); });
+    db.collection('farmerPurchases').orderBy('createdAt','desc').onSnapshot(s=>{ this.farmerPurchases = s.docs.map(d=>({id:d.id,...d.data()})); this._notifyIfRelevant(['purchases']); });
     db.collection('users').onSnapshot(s=>{ this.users = s.docs.map(d=>({id:d.id,...d.data()})); this._notifyIfRelevant(['users']); });
 
     db.collection('activity').orderBy('at','desc').limit(200).onSnapshot(s=>{
@@ -741,11 +857,14 @@ class DashboardPage extends Page {
     const openEnq = this.store.enquiries.filter(e=>e.status!=='closed').length;
     const pendingPay = this.store.sales.filter(s=>s.paymentStatus==='paid_pending_ack').length;
     const recent = this.store.enquiries.slice(0,6);
+    const stockCard = isAdmin
+      ? this._stat('package', this.store.inventory.reduce((a,i)=>a+Number(i.qty||0),0), 'Warehouse Stock (qtl)')
+      : this._stat('package', this.store.managerStock.filter(m=>m.managerId===this.user.uid).reduce((a,m)=>a+Number(m.qty||0),0), 'My Stock (qtl)');
     return `
     <div class="grid cards">
       ${this._stat('message-square', openEnq, 'Open Enquiries')}
       ${this._stat('clipboard-list', pendingOrders, isAdmin?'Pending Orders':'My Pending Orders')}
-      ${this._stat('wheat', this.store.products.length, 'Products')}
+      ${stockCard}
       ${this._stat('banknote', pendingPay, 'Payments Awaiting Ack')}
     </div>
     <div style="margin-top:20px" class="table-wrap">
@@ -805,32 +924,45 @@ class EnquiriesPage extends Page {
 class ProductsPage extends Page {
   render(){
     const rows = this.store.products.map(p=>{
-      const hist = (p.rateHistory||[]).slice(-3).reverse().map(r=>`${r.date}: ₹${r.rate}`).join(' · ');
-      return `<tr><td>${p.name}</td><td>₹${p.currentRate||'-'} /qtl</td><td class="muted" style="font-size:12px">${hist||'-'}</td>
-        <td><button class="btn btn-secondary btn-small" onclick="App.pages.products.openRateModal('${p.id}','${p.name}')">Update Rate</button></td></tr>`;
+      const wHist = (p.rateHistory||[]).slice(-2).reverse().map(r=>`${r.date}: ₹${r.rate}`).join(' · ');
+      const rHist = (p.retailRateHistory||[]).slice(-2).reverse().map(r=>`${r.date}: ₹${r.rate}`).join(' · ');
+      return `<tr>
+        <td>${p.name}</td>
+        <td>₹${p.currentRate||'-'} /qtl<div class="muted" style="font-size:11px">${wHist||'-'}</div></td>
+        <td>₹${p.retailRate||'-'} /qtl<div class="muted" style="font-size:11px">${rHist||'-'}</div></td>
+        <td>
+          <button class="btn btn-secondary btn-small" onclick="App.pages.products.openRateModal('${p.id}','${p.name}')">Wholesale</button>
+          <button class="btn btn-secondary btn-small" onclick="App.pages.products.openRetailRateModal('${p.id}','${p.name}')">Retail</button>
+        </td></tr>`;
     }).join('');
     return `
-    <div class="page-head"><p>Set today's rate per product. Rate history is kept date-wise.</p>
+    <div class="page-head"><p>Wholesale rate is what managers pay to draw stock; retail rate is the fixed price they must sell to customers at. Both are tracked date-wise.</p>
       <button class="btn btn-primary btn-small" onclick="App.pages.products.openAddModal()">${Icons.svg('plus',15)} Add Product</button></div>
-    <div class="table-wrap"><table><thead><tr><th>Product</th><th>Current Rate</th><th>Recent History</th><th></th></tr></thead>
+    <div class="table-wrap"><table><thead><tr><th>Product</th><th>Wholesale Rate (→ Manager)</th><th>Retail Rate (→ Customer)</th><th></th></tr></thead>
     <tbody>${rows || `<tr><td colspan="4">${this.emptyState('wheat','No products yet — add your first one.')}</td></tr>`}</tbody></table></div>`;
   }
   openAddModal(){
     Modal.open(`<h3>Add Product</h3>
       <div class="field"><label>Product Name</label><input id="pName"></div>
-      <div class="field"><label>Starting Rate (₹ per quintal)</label><input id="pRate" type="number"></div>
+      <div class="field"><label>Wholesale Rate — to Manager (₹ per quintal)</label><input id="pRate" type="number"></div>
+      <div class="field"><label>Retail Rate — to Customer (₹ per quintal)</label><input id="pRetailRate" type="number"></div>
       <div class="row"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="App.pages.products.save()">Save</button></div>`);
   }
   async save(){
     const name = document.getElementById('pName').value.trim();
     const rate = Number(document.getElementById('pRate').value);
-    if(!name || !rate) return;
+    const retailRate = Number(document.getElementById('pRetailRate').value);
+    if(!name || !rate || !retailRate) return;
     const today = new Date().toISOString().slice(0,10);
-    await this.db.collection('products').add({ name, currentRate: rate, rateHistory: [{date:today, rate}] });
+    await this.db.collection('products').add({
+      name, currentRate: rate, rateHistory: [{date:today, rate}],
+      retailRate, retailRateHistory: [{date:today, rate:retailRate}]
+    });
     Modal.close();
   }
   openRateModal(id, name){
-    Modal.open(`<h3>Update Rate — ${name}</h3>
+    Modal.open(`<h3>Update Wholesale Rate — ${name}</h3>
+      <p class="muted">This is what managers pay when they draw stock from you.</p>
       <div class="field"><label>New Rate (₹ per quintal)</label><input id="newRate" type="number"></div>
       <div class="row"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="App.pages.products.saveRate('${id}')">Update</button></div>`);
   }
@@ -843,7 +975,25 @@ class ProductsPage extends Page {
     const hist = snap.data().rateHistory || [];
     hist.push({date: today, rate});
     await ref.update({ currentRate: rate, rateHistory: hist });
-    await this.app.activity.log('rate', `Rate updated for product to ₹${rate}/qtl`);
+    await this.app.activity.log('rate', `Wholesale rate updated for product to ₹${rate}/qtl`);
+    Modal.close();
+  }
+  openRetailRateModal(id, name){
+    Modal.open(`<h3>Update Retail Rate — ${name}</h3>
+      <p class="muted">This is the fixed price managers must sell to customers at.</p>
+      <div class="field"><label>New Retail Rate (₹ per quintal)</label><input id="newRetailRate" type="number"></div>
+      <div class="row"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="App.pages.products.saveRetailRate('${id}')">Update</button></div>`);
+  }
+  async saveRetailRate(id){
+    const rate = Number(document.getElementById('newRetailRate').value);
+    if(!rate) return;
+    const today = new Date().toISOString().slice(0,10);
+    const ref = this.db.collection('products').doc(id);
+    const snap = await ref.get();
+    const hist = snap.data().retailRateHistory || [];
+    hist.push({date: today, rate});
+    await ref.update({ retailRate: rate, retailRateHistory: hist });
+    await this.app.activity.log('rate', `Retail rate updated for product to ₹${rate}/qtl`);
     Modal.close();
   }
 }
@@ -856,11 +1006,14 @@ class OrdersPage extends Page {
       <tr>
         <td>${o.product}</td><td>${o.qty} qtl</td><td>₹${o.adminRate}/qtl</td><td>₹${(o.qty*o.adminRate).toLocaleString('en-IN')}</td>
         <td>${o.managerName}</td>
-        <td><span class="badge ${o.status==='executed'?'b-executed':'b-pending'}">${o.status}</span></td>
-        <td>${isAdmin && o.status==='placed' ? `<button class="btn btn-primary btn-small" onclick="App.pages.orders.execute('${o.id}')">Execute & Notify</button>` : (o.status==='executed' ? `<span class="muted" style="font-size:12px">${Icons.svg('check',13)} Notified</span>` : '')}</td>
+        <td><span class="badge ${o.status==='executed'?'b-completed':(o.status==='rejected'?'b-closed':'b-pending')}">${o.status==='executed'?'approved':o.status}</span></td>
+        <td>
+          ${isAdmin && o.status==='placed' ? `<button class="btn btn-primary btn-small" onclick="App.pages.orders.approve('${o.id}')">Approve</button> <button class="btn btn-danger btn-small" onclick="App.pages.orders.reject('${o.id}')">Reject</button>` : ''}
+          ${o.status==='executed' && o.pdfDataUrl ? `<button class="btn btn-secondary btn-small" onclick="App.pages.orders.downloadPdf('${o.id}')">${Icons.svg('download',13)} PDF</button>` : ''}
+        </td>
       </tr>`).join('');
     return `
-    <div class="page-head"><p>${isAdmin?'Execute orders to notify the manager on WhatsApp with amount + UPI.':'Place a new order request to admin.'}</p>
+    <div class="page-head"><p>${isAdmin?'Approve orders to transfer stock and issue a PDF summary to the manager.':'Order stock from the admin warehouse.'}</p>
       ${!isAdmin ? `<button class="btn btn-primary btn-small" onclick="App.pages.orders.openModal()">${Icons.svg('plus',15)} New Order</button>` : ''}</div>
     <div class="table-wrap"><table><thead><tr><th>Product</th><th>Qty</th><th>Rate</th><th>Amount</th><th>Manager</th><th>Status</th><th></th></tr></thead>
     <tbody>${rows || `<tr><td colspan="7">${this.emptyState('clipboard-list','No orders yet.')}</td></tr>`}</tbody></table></div>`;
@@ -869,14 +1022,23 @@ class OrdersPage extends Page {
     Modal.open(`<h3>Place Order</h3>
       <div class="field"><label>Product</label><select id="oProduct">${this.store.products.map(p=>`<option value="${p.name}" data-rate="${p.currentRate}">${p.name} (₹${p.currentRate}/qtl)</option>`).join('')}</select></div>
       <div class="field"><label>Quantity (quintal)</label><input id="oQty" type="number"></div>
-      <div class="row"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="App.pages.orders.save()">Submit Order</button></div>`);
+      <div class="row"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="App.pages.orders.review()">Review Order</button></div>`);
   }
-  async save(){
+  /** Step 2: show a Yes/Cancel confirmation with the computed amount before
+   *  anything is actually written to the database. */
+  review(){
     const sel = document.getElementById('oProduct');
     const product = sel.value;
     const adminRate = Number(sel.selectedOptions[0].dataset.rate);
     const qty = Number(document.getElementById('oQty').value);
-    if(!qty) return;
+    if(!qty){ return; }
+    const amount = qty * adminRate;
+    Modal.open(`<h3>Confirm Order</h3>
+      <p style="font-size:15px;line-height:1.6">Buy <b>${qty} quintal</b> of <b>${product}</b> @ <b>₹${adminRate}/qtl</b>?<br>Total cost: <b>₹${amount.toLocaleString('en-IN')}</b></p>
+      <div class="row"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
+      <button class="btn btn-primary" onclick="App.pages.orders.save('${product}',${adminRate},${qty})">Yes, Place Order</button></div>`);
+  }
+  async save(product, adminRate, qty){
     await this.db.collection('orders').add({
       product, qty, adminRate, status: 'placed',
       managerId: this.user.uid, managerName: this.user.name, managerPhone: this.user.phone||'',
@@ -885,15 +1047,47 @@ class OrdersPage extends Page {
     await this.app.activity.log('order', `${this.user.name} placed order for ${product} × ${qty} qtl`);
     Modal.close();
   }
-  async execute(id){
+  /** Shown automatically to admin when a new order comes in, and also
+   *  reachable from the Orders table itself. */
+  showApprovalPrompt(order){
+    Modal.open(`<h3>New Order Received</h3>
+      <p style="font-size:15px;line-height:1.6"><b>${order.managerName}</b> has placed an order for <b>${order.qty} quintal</b> of <b>${order.product}</b> @ <b>₹${order.adminRate}/qtl</b> (₹${(order.qty*order.adminRate).toLocaleString('en-IN')} total).</p>
+      <div class="row"><button class="btn btn-ghost" onclick="Modal.close()">Decide Later</button>
+      <button class="btn btn-danger btn-small" onclick="App.pages.orders.reject('${order.id}')">Reject</button>
+      <button class="btn btn-primary" onclick="App.pages.orders.approve('${order.id}')">Approve</button></div>`);
+  }
+  async approve(id){
     const ref = this.db.collection('orders').doc(id);
     const snap = await ref.get();
-    const o = snap.data();
+    const o = { id, ...snap.data() };
+    const product = this.store.products.find(p=>p.name===o.product);
+    try{
+      await this.app.stock.transferToManager({ product: o.product, qty: o.qty, managerId: o.managerId, managerName: o.managerName });
+    }catch(e){
+      alert(e.message);
+      Modal.close();
+      return;
+    }
     const amount = o.qty * o.adminRate;
-    await ref.update({ status: 'executed', executedAt: firebase.firestore.FieldValue.serverTimestamp(), totalAmount: amount });
-    await this.app.activity.log('order', `Order executed: ${o.product} × ${o.qty} qtl`);
-    const msg = `Namaste ${o.managerName} ji,\nAapka order — ${o.product} ki matra ${o.qty} quintal @ ₹${o.adminRate} prati quintal — place kar diya gaya hai.\nKripya Rs. ${amount.toLocaleString('en-IN')} UPI par bhejें.\nDhanyavaad — Pacific Wisdom Agrotech`;
+    const pdfDataUrl = PdfService.generateOrderSummary(o);
+    await ref.update({
+      status: 'executed', executedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      totalAmount: amount, retailRateAtOrder: product ? product.retailRate : null, pdfDataUrl
+    });
+    await this.app.activity.log('order', `Order approved: ${o.product} × ${o.qty} qtl → ${o.managerName}`);
+    const msg = `Namaste ${o.managerName} ji,\nAapka order — ${o.product} ki matra ${o.qty} quintal @ ₹${o.adminRate} prati quintal — approve kar diya gaya hai.\nKripya Rs. ${amount.toLocaleString('en-IN')} UPI par bhejें.\nDhanyavaad — Pacific Wisdom Agrotech`;
     WhatsAppService.open(o.managerPhone, msg);
+    Modal.close();
+  }
+  async reject(id){
+    await this.db.collection('orders').doc(id).update({ status: 'rejected' });
+    await this.app.activity.log('order', `Order rejected`);
+    Modal.close();
+  }
+  async downloadPdf(id){
+    const snap = await this.db.collection('orders').doc(id).get();
+    const o = snap.data();
+    PdfService.download(o.pdfDataUrl, `Order-${o.product}-${id.slice(0,6)}.pdf`);
   }
 }
 
@@ -902,6 +1096,7 @@ class SalesPage extends Page {
   render(){
     const isAdmin = this.user.role==='admin';
     const list = isAdmin ? this.store.sales : this.store.sales.filter(s=>s.managerId===this.user.uid);
+    const myStock = isAdmin ? [] : this.store.managerStock.filter(m=>m.managerId===this.user.uid && m.qty>0);
     const rows = list.map(s=>`
       <tr>
         <td>${s.product}</td><td>${s.qty} qtl</td><td>₹${s.sellRate}</td><td>₹${s.adminRate}</td>
@@ -913,43 +1108,70 @@ class SalesPage extends Page {
           ${(isAdmin && s.paymentStatus==='paid_pending_ack') ? `<button class="btn btn-primary btn-small" onclick="App.pages.sales.ack('${s.id}')">Acknowledge</button>` : ''}
         </td>
       </tr>`).join('');
+    const stockTable = !isAdmin ? `
+    <div class="card" style="margin-bottom:16px">
+      <div class="section-title">${Icons.svg('package',18)} My Stock</div>
+      ${myStock.length ? `<table><thead><tr><th>Product</th><th>Qty on hand</th></tr></thead><tbody>
+        ${myStock.map(m=>`<tr><td>${m.product}</td><td>${m.qty} qtl</td></tr>`).join('')}</tbody></table>`
+        : `<p class="muted">No stock yet — order from admin first.</p>`}
+    </div>` : '';
     return `
-    <div class="page-head"><p>${isAdmin?'Profit-share auto-calculates when a manager sells above your set rate.':'Record what you sold at. If above admin rate, 20% profit-share is calculated automatically.'}</p>
+    ${stockTable}
+    <div class="page-head"><p>${isAdmin?'Profit-share (20%) is calculated automatically from the gap between wholesale and retail rate.':'Sell at the fixed retail rate — the amount to collect is calculated for you.'}</p>
       ${!isAdmin ? `<button class="btn btn-primary btn-small" onclick="App.pages.sales.openModal()">${Icons.svg('plus',15)} Record Sale</button>` : ''}</div>
-    <div class="table-wrap"><table><thead><tr><th>Product</th><th>Qty</th><th>Sell Rate</th><th>Admin Rate</th><th>Profit</th><th>20% Share</th><th>Payment</th><th></th></tr></thead>
+    <div class="table-wrap"><table><thead><tr><th>Product</th><th>Qty</th><th>Retail Rate</th><th>Wholesale Rate</th><th>Profit</th><th>Your 20% Share</th><th>Payment</th><th></th></tr></thead>
     <tbody>${rows || `<tr><td colspan="8">${this.emptyState('banknote','No sales recorded yet.')}</td></tr>`}</tbody></table></div>`;
   }
   openModal(){
-    const myOrders = this.store.orders.filter(o=>o.managerId===this.user.uid && o.status==='executed');
+    const myStock = this.store.managerStock.filter(m=>m.managerId===this.user.uid && m.qty>0);
+    if(!myStock.length){ alert('You have no stock to sell yet — place and get an order approved first.'); return; }
     Modal.open(`<h3>Record Sale</h3>
-      <div class="field"><label>Against Order</label><select id="sOrder">${myOrders.map(o=>`<option value="${o.id}" data-product="${o.product}" data-rate="${o.adminRate}">${o.product} — ${o.qty} qtl @ ₹${o.adminRate}</option>`).join('') || '<option value="">No executed orders</option>'}</select></div>
+      <div class="field"><label>Product</label>
+        <select id="sProduct" onchange="App.pages.sales.updateAvailable(this)">
+          ${myStock.map(m=>{
+            const p = this.store.products.find(pr=>pr.name===m.product);
+            return `<option value="${m.product}" data-available="${m.qty}" data-retail="${p?p.retailRate:0}" data-wholesale="${p?p.currentRate:0}">${m.product} (${m.qty} qtl available)</option>`;
+          }).join('')}
+        </select>
+      </div>
+      <p class="muted" id="sAvailableHint" style="margin:-6px 0 0"></p>
       <div class="field"><label>Quantity Sold (quintal)</label><input id="sQty" type="number"></div>
-      <div class="field"><label>Sell Rate (₹ per quintal)</label><input id="sRate" type="number"></div>
       <div class="row"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="App.pages.sales.save()">Save Sale</button></div>`);
+    this.updateAvailable(document.getElementById('sProduct'));
+  }
+  updateAvailable(sel){
+    const opt = sel.selectedOptions[0];
+    document.getElementById('sAvailableHint').textContent =
+      `${opt.dataset.available} qtl on hand · retail rate ₹${opt.dataset.retail}/qtl`;
   }
   async save(){
-    const sel = document.getElementById('sOrder');
-    if(!sel.value) return;
-    const product = sel.selectedOptions[0].dataset.product;
-    const adminRate = Number(sel.selectedOptions[0].dataset.rate);
+    const sel = document.getElementById('sProduct');
+    const opt = sel.selectedOptions[0];
+    const product = sel.value;
+    const retailRate = Number(opt.dataset.retail);
+    const adminRate = Number(opt.dataset.wholesale);
     const qty = Number(document.getElementById('sQty').value);
-    const sellRate = Number(document.getElementById('sRate').value);
-    if(!qty || !sellRate) return;
-    let profit = 0, profitShare = 0;
-    if(sellRate > adminRate){ profit = (sellRate - adminRate) * qty; profitShare = Math.round(profit * 0.2); }
+    if(!qty){ return; }
+    try{
+      await this.app.stock.deductManagerStock({ managerId: this.user.uid, product, qty });
+    }catch(e){
+      alert(e.message);
+      return;
+    }
+    const billAmount = qty * retailRate;
+    const profit = Math.max(0, (retailRate - adminRate) * qty);
+    const profitShare = Math.round(profit * 0.2);
     await this.db.collection('sales').add({
-      orderId: sel.value, product, qty, sellRate, adminRate, profit, profitShare,
+      product, qty, sellRate: retailRate, adminRate, profit, profitShare,
       managerId: this.user.uid, managerName: this.user.name,
       paymentStatus: profitShare>0 ? 'none' : 'completed',
       createdAt: firebase.firestore.FieldValue.serverTimestamp()
     });
-    await this.app.activity.log('sale', `${this.user.name} sold ${product} × ${qty} qtl @ ₹${sellRate}`);
-    if(profitShare > 0){
-      const adminUser = this.store.users.find(u=>u.role==='admin') || {};
-      const msg = `Namaste,\nAapne ${product} ki matra ${qty} quintal @ ₹${sellRate} rate par bechi hai.\nAapko ₹${profit.toLocaleString('en-IN')} ka profit hua hai.\nKripya profit ka 20% (₹${profitShare.toLocaleString('en-IN')}) amount ${SalesPage.ADMIN_DISPLAY_NAME} ko bhejें.`;
-      WhatsAppService.open(adminUser.phone, msg);
-    }
+    await this.app.activity.log('sale', `${this.user.name} sold ${product} × ${qty} qtl @ ₹${retailRate}`);
     Modal.close();
+    Modal.open(`<h3>${Icons.svg('banknote',18)} Collect Payment</h3>
+      <p style="font-size:16px;line-height:1.6">Collect <b>₹${billAmount.toLocaleString('en-IN')}</b> from the customer for <b>${qty} quintal</b> of <b>${product}</b> @ ₹${retailRate}/qtl.</p>
+      <button class="btn btn-primary" style="width:100%" onclick="Modal.close()">OK, Got It</button>`);
   }
   async markPaid(id){
     const ref = this.db.collection('sales').doc(id);
@@ -1000,20 +1222,77 @@ class CrmPage extends Page {
 class InventoryPage extends Page {
   render(){
     const rows = this.store.inventory.map(i=>`<tr><td>${i.product}</td><td>${i.qty}</td><td>${i.unit||'quintal'}</td><td><button class="btn btn-danger btn-small" onclick="App.pages.inventory.remove('${i.id}')">Delete</button></td></tr>`).join('');
-    return `<div class="page-head"><p>Track stock on hand.</p><button class="btn btn-primary btn-small" onclick="App.pages.inventory.openModal()">${Icons.svg('plus',15)} Add Stock</button></div>
+    return `<div class="page-head"><p>Your central warehouse stock — increases automatically when you record a farmer purchase, decreases when you approve a manager's order.</p><button class="btn btn-primary btn-small" onclick="App.pages.inventory.openModal()">${Icons.svg('plus',15)} Manual Adjustment</button></div>
     <div class="table-wrap"><table><thead><tr><th>Product</th><th>Qty</th><th>Unit</th><th></th></tr></thead>
-    <tbody>${rows || `<tr><td colspan="4">${this.emptyState('package','No stock recorded.')}</td></tr>`}</tbody></table></div>`;
+    <tbody>${rows || `<tr><td colspan="4">${this.emptyState('package','No stock recorded — record a farmer purchase to get started.')}</td></tr>`}</tbody></table></div>`;
   }
   openModal(){
-    Modal.open(`<h3>Add Stock</h3><div class="field"><label>Product</label><select id="invProduct">${this.store.products.map(p=>`<option>${p.name}</option>`).join('')}</select></div>
-    <div class="field"><label>Quantity</label><input id="invQty" type="number"></div>
+    Modal.open(`<h3>Manual Stock Adjustment</h3><p class="muted">For corrections only — normal stock flows through Purchases and Order approvals.</p>
+    <div class="field"><label>Product</label><select id="invProduct">${this.store.products.map(p=>`<option>${p.name}</option>`).join('')}</select></div>
+    <div class="field"><label>Quantity to add (use a negative number to subtract)</label><input id="invQty" type="number"></div>
     <div class="row"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="App.pages.inventory.save()">Save</button></div>`);
   }
   async save(){
-    await this.db.collection('inventory').add({ product: document.getElementById('invProduct').value, qty: Number(document.getElementById('invQty').value), unit:'quintal' });
+    const product = document.getElementById('invProduct').value;
+    const qty = Number(document.getElementById('invQty').value);
+    if(!qty) return;
+    const snap = await this.db.collection('inventory').where('product','==',product).limit(1).get();
+    if(snap.empty){
+      await this.db.collection('inventory').add({ product, qty, unit:'quintal' });
+    } else {
+      const doc = snap.docs[0];
+      await doc.ref.update({ qty: (doc.data().qty||0) + qty });
+    }
     Modal.close();
   }
   async remove(id){ if(confirm('Delete this record?')) await this.db.collection('inventory').doc(id).delete(); }
+}
+
+class PurchasesPage extends Page {
+  render(){
+    const rows = this.store.farmerPurchases.map(p=>`<tr>
+      <td>${p.farmerName}${p.phone ? `<div class="muted" style="font-size:12px">${p.phone}</div>` : ''}</td>
+      <td>${p.product}</td><td>${p.qty} qtl</td><td>₹${p.rate}/qtl</td><td>₹${p.amount.toLocaleString('en-IN')}</td>
+      <td>${p.createdAt ? new Date(p.createdAt.seconds*1000).toLocaleDateString() : '-'}</td>
+    </tr>`).join('');
+    return `<div class="page-head"><p>Record what you buy from farmers — this adds straight into your warehouse stock.</p>
+    <button class="btn btn-primary btn-small" onclick="App.pages.purchases.openModal()">${Icons.svg('plus',15)} Record Purchase</button></div>
+    <div class="table-wrap"><table><thead><tr><th>Farmer</th><th>Product</th><th>Qty</th><th>Rate</th><th>Amount</th><th>Date</th></tr></thead>
+    <tbody>${rows || `<tr><td colspan="6">${this.emptyState('tractor','No purchases recorded yet.')}</td></tr>`}</tbody></table></div>`;
+  }
+  openModal(){
+    Modal.open(`<h3>Record Farmer Purchase</h3>
+      <div class="field"><label>Farmer</label>
+        <select id="pfFarmerSelect" onchange="App.pages.purchases.onFarmerPick(this)">
+          <option value="">— Type a new name below —</option>
+          ${this.store.farmers.map(f=>`<option value="${f.name}" data-phone="${f.phone||''}">${f.name}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field"><label>Farmer Name</label><input id="pfName"></div>
+      <div class="field"><label>Phone (optional)</label><input id="pfPhone"></div>
+      <div class="field"><label>Product</label><select id="pfProduct">${this.store.products.map(p=>`<option>${p.name}</option>`).join('')}</select></div>
+      <div class="row">
+        <div class="field"><label>Quantity (quintal)</label><input id="pfQty" type="number"></div>
+        <div class="field"><label>Rate (₹ per quintal)</label><input id="pfRate" type="number"></div>
+      </div>
+      <div class="row"><button class="btn btn-ghost" onclick="Modal.close()">Cancel</button><button class="btn btn-primary" onclick="App.pages.purchases.save()">Record & Add to Stock</button></div>`);
+  }
+  onFarmerPick(sel){
+    if(!sel.value) return;
+    document.getElementById('pfName').value = sel.value;
+    document.getElementById('pfPhone').value = sel.selectedOptions[0].dataset.phone || '';
+  }
+  async save(){
+    const farmerName = document.getElementById('pfName').value.trim();
+    const phone = document.getElementById('pfPhone').value.trim();
+    const product = document.getElementById('pfProduct').value;
+    const qty = Number(document.getElementById('pfQty').value);
+    const rate = Number(document.getElementById('pfRate').value);
+    if(!farmerName || !qty || !rate) return;
+    await this.app.stock.recordFarmerPurchase({ farmerName, phone, product, qty, rate, createdBy: this.user.uid });
+    await this.app.activity.log('purchase', `${this.user.name} bought ${qty} qtl ${product} from ${farmerName}`);
+    Modal.close();
+  }
 }
 
 class UsersPage extends Page {
@@ -1213,9 +1492,10 @@ class Router {
     ]},
     {section:'Admin', items:[
       {id:'products', label:'Products & Rates', icon:'wheat', roles:['admin']},
+      {id:'purchases', label:'Purchases (from Farmers)', icon:'sprout', roles:['admin']},
       {id:'farmers', label:'Farmers', icon:'tractor', roles:['admin']},
       {id:'customers', label:'Customers', icon:'users', roles:['admin']},
-      {id:'inventory', label:'Inventory', icon:'package', roles:['admin']},
+      {id:'inventory', label:'Warehouse Stock', icon:'package', roles:['admin']},
       {id:'users', label:'Manage Managers', icon:'user-plus', roles:['admin']},
       {id:'activity', label:'Activity Log', icon:'history', roles:['admin']},
     ]},
@@ -1296,6 +1576,7 @@ class ERPApplication {
     this.notifications = new NotificationCenter();
     this.activity = new ActivityLogger(this.fb, () => this.currentUser);
     this.store = new DataStore(this.fb, this.notifications, this.activity);
+    this.stock = new StockService(this.fb.db);
     this.auth = new AuthController(this);
     this.router = new Router(this);
 
@@ -1305,6 +1586,7 @@ class ERPApplication {
       orders: new OrdersPage(this),
       sales: new SalesPage(this),
       products: new ProductsPage(this),
+      purchases: new PurchasesPage(this),
       farmers: new CrmPage(this, 'farmers', ['Name','Phone','Village','Product'], 'tractor'),
       customers: new CrmPage(this, 'customers', ['Name','Phone','City','Notes'], 'users'),
       inventory: new InventoryPage(this),
@@ -1312,6 +1594,17 @@ class ERPApplication {
       activity: new ActivityPage(this),
       reports: new ReportsPage(this),
       settings: new SettingsPage(this),
+    };
+
+    // A brand-new order/sale pops an approval/awareness modal for the admin
+    // automatically, on top of the normal toast notification.
+    this.store.onNewOrder = (order) => this.pages.orders.showApprovalPrompt(order);
+    this.store.onNewSale = (sale) => {
+      if(sale.profitShare > 0){
+        Modal.open(`<h3>${Icons.svg('banknote',18)} New Sale</h3>
+          <p style="font-size:15px;line-height:1.6"><b>${sale.managerName}</b> sold <b>${sale.qty} quintal</b> of <b>${sale.product}</b> @ ₹${sale.sellRate}/qtl.<br>Your 20% share: <b>₹${sale.profitShare.toLocaleString('en-IN')}</b></p>
+          <button class="btn btn-primary" style="width:100%" onclick="Modal.close()">OK</button>`);
+      }
     };
   }
   init(){

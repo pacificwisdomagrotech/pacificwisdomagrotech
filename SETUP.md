@@ -42,12 +42,24 @@ service cloud.firestore {
     match /enquiries/{id}  { allow read, create: if isSignedIn(); allow update: if isAdmin(); }
     match /orders/{id}     { allow read: if isSignedIn(); allow create: if isSignedIn(); allow update: if isAdmin(); }
     match /sales/{id}      { allow read: if isSignedIn(); allow create: if isSignedIn(); allow update: if isSignedIn(); }
+    match /farmerPurchases/{id} { allow read, write: if isAdmin(); }
+    match /managerStock/{id}   { allow read: if isSignedIn(); allow write: if isSignedIn(); }
     match /activity/{id}   { allow read: if isAdmin(); allow create: if isSignedIn(); }
   }
 }
 ```
 
 Publish the rules.
+
+## New in this update: crop-trading workflow
+
+The app now models a real 3-tier crop trading flow:
+
+1. **Admin buys from farmers** — Products & Rates page now has two prices per product: a **Wholesale Rate** (what managers pay you) and a **Retail Rate** (the fixed price managers must resell to customers at). Go to **Purchases** to record what you buy from a farmer — it's added straight into your **Warehouse Stock**.
+2. **Manager orders from your warehouse** — they pick a product + quantity, confirm the cost in a popup, and it lands in your Orders list as pending.
+3. **You approve or reject** — approving moves stock from your warehouse into that manager's own stock ledger, generates a PDF order summary (downloadable inside the app, no email needed), and sends a WhatsApp payment request as before. A popup appears automatically the moment a new order comes in while you're using the app.
+4. **Manager sells to a customer** at the fixed retail rate — the app tells them exactly how much to collect, and automatically calculates your 20% profit-share on the wholesale-to-retail margin. You get a popup notification with your share the moment it happens.
+5. **Manager marks paid → you acknowledge** — same payment-confirmation loop as before.
 
 ## 3. Create your first Admin account
 
