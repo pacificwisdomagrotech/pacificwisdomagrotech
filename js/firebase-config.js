@@ -13,3 +13,9 @@ const firebaseConfig = {
   messagingSenderId: "706520531855",
   appId: "1:706520531855:web:a50634e36e258cf48b41fa"
 };
+
+/* Your WhatsApp number (with country code, e.g. 91XXXXXXXXXX) — used by the
+ * "Forgot password?" link on the login screen. Since accounts don't use
+ * real email inboxes, password recovery goes through you on WhatsApp
+ * instead of an email link. */
+const SUPPORT_WHATSAPP = "919975374625";
