@@ -14,18 +14,26 @@ class AuthController {
       if(!udoc.exists) return;
       const userData = { uid: user.uid, ...udoc.data() };
       if(BiometricLock.isEnabled(user.uid)){
-        this._showLockScreen(userData);
+        this._showBiometricTab(userData);
       } else {
         await this._completeLogin(user.uid);
       }
     });
   }
 
-  _showLockScreen(userData){
+  /** Populates the Biometric tab with a "Welcome back" unlock prompt and
+   *  switches straight to it, since we already know who this device
+   *  belongs to and that they've opted into biometric unlock. */
+  _showBiometricTab(userData){
     this._lockedUser = userData;
-    document.getElementById('loginCard').style.display = 'none';
-    document.getElementById('lockCard').style.display = 'block';
-    document.getElementById('lockName').textContent = `Welcome back, ${userData.name}`;
+    document.getElementById('bioTabContent').innerHTML = `
+      <div class="brand-mark" style="background:var(--p-soft);color:var(--p);width:56px;height:56px;border-radius:16px;margin:0 auto 16px;font-size:24px">🔒</div>
+      <h3 style="margin-bottom:4px">Welcome back, ${userData.name}</h3>
+      <p class="muted">Unlock with your fingerprint or face to continue.</p>
+      <button class="btn btn-primary" style="width:100%" onclick="App.auth.unlockWithBiometric()">Unlock</button>
+      <button class="btn btn-ghost btn-small" style="width:100%;margin-top:10px" onclick="App.auth.logout()">Use password instead</button>
+      <div class="err" id="lockErr"></div>`;
+    switchLoginTab('biometric');
   }
 
   async unlockWithBiometric(){
@@ -102,12 +110,17 @@ class AuthController {
     this._restoring = false;
     document.getElementById('appShell').style.display = 'none';
     document.getElementById('loginScreen').style.display = 'grid';
-    document.getElementById('loginCard').style.display = 'block';
-    document.getElementById('lockCard').style.display = 'none';
     document.getElementById('loginStep').style.display = 'block';
     document.getElementById('otpStep').style.display = 'none';
     document.getElementById('loginEmail').value = '';
     document.getElementById('loginPassword').value = '';
+    // Reset the Biometric tab back to its default explanatory state and
+    // return focus to the Password tab, since there's no session anymore.
+    document.getElementById('bioTabContent').innerHTML = `
+      <div class="brand-mark" style="background:var(--p-soft);color:var(--p);width:56px;height:56px;border-radius:16px;margin:0 auto 16px;font-size:24px">🔒</div>
+      <p class="muted">Sign in with your password first, then enable biometric unlock from Settings for faster access next time.</p>
+      <button class="btn btn-secondary btn-small" onclick="switchLoginTab('password')">Go to Password Tab</button>`;
+    switchLoginTab('password');
   }
 
   _roleLabel(role){ return role.charAt(0).toUpperCase()+role.slice(1); }
@@ -118,4 +131,3 @@ class AuthController {
     return e.message;
   }
 }
-
