@@ -62,6 +62,10 @@ a{color:inherit}
 .login-foot{font-size:12px;opacity:.65;position:relative;z-index:1}
 .login-panel{display:grid;place-items:center;padding:32px}
 .login-card{width:min(400px,100%)}
+.login-tabs{display:flex;gap:6px;background:var(--p-soft);border-radius:12px;padding:4px;margin:18px 0}
+.login-tab{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;border:0;background:transparent;color:var(--muted);font-weight:700;font-size:13.5px;padding:10px 8px;border-radius:9px;transition:background .15s, color .15s}
+.login-tab.active{background:var(--card);color:var(--p);box-shadow:0 2px 8px rgba(0,0,0,.08)}
+.login-tab svg{flex:none}
 .login-card h2{font-size:24px;margin-bottom:4px}
 .field{margin:16px 0}
 .field label{display:block;font-size:12.5px;font-weight:600;margin-bottom:7px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
@@ -114,7 +118,9 @@ a{color:inherit}
 
 .grid{display:grid;gap:14px}
 .cards{grid-template-columns:repeat(4,minmax(0,1fr))}
-.stat-card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:20px;box-shadow:var(--shadow)}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:20px;box-shadow:var(--shadow);transition:transform .12s, box-shadow .12s}
+.stat-card[onclick]:hover{transform:translateY(-2px);box-shadow:0 16px 36px rgba(0,0,0,.12)}
+.stat-card[onclick]:active{transform:translateY(0)}
 .stat-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
 .stat-icon{width:38px;height:38px;border-radius:11px;background:var(--p-soft);color:var(--p);display:grid;place-items:center}
 .stat-num{font-size:27px;font-weight:700}
