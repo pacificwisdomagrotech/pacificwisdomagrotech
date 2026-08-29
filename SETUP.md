@@ -138,6 +138,33 @@ placeholders) — just don't reuse those in a real deployment, since anyone
 who reads this file could guess them. The login screen itself shows no
 password hints, as required.
 
+## Forgot password — set your WhatsApp number
+
+Open `js/firebase-config.js` and set `SUPPORT_WHATSAPP` to your number
+(with country code, e.g. `91XXXXXXXXXX`). Since accounts here don't use
+real, checkable email inboxes, "Forgot password?" on the login screen
+opens a WhatsApp message to you instead of emailing a reset link — the
+same pattern the rest of the app already uses for order and payment
+notifications.
+
+**Important limitation to know about:** Firebase deliberately does not
+allow changing someone else's password from app code — not even for an
+admin — without a paid backend (Cloud Functions). So when a manager messages
+you asking for a reset, the real recovery steps are:
+
+1. Firebase Console → Authentication → Users → find their account → delete it
+2. In the app, go to **Manage Managers** → Add Manager again with the same
+   email and a new password
+
+One caveat: deleting and recreating gives them a new internal ID, so their
+*past* orders and sales will still exist in Reports but won't show up
+under their live account going forward. For a team this size that's a rare,
+manageable trade-off — but if you'd rather avoid it entirely, the cleanest
+fix is to use each person's real personal email (Gmail etc.) as their
+account email instead of a placeholder — then the standard "email a reset
+link" flow works properly with zero extra steps, and I can switch the
+login screen back to that if you'd prefer it later.
+
 ## 5. Publish on GitHub Pages
 
 1. Create a new GitHub repo, e.g. `pw-agrotech-erp`.
