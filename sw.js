@@ -1,4 +1,4 @@
-const CACHE = 'pwagro-v2';
+const CACHE = 'pwagro-v3';
 const SHELL = [
   './index.html', './manifest.json', './css/styles.css',
   './js/core/services.js', './js/core/store.js', './js/core/notifications-biometric.js',
@@ -19,17 +19,21 @@ self.addEventListener('activate', (e) => {
   e.waitUntil(
     caches.keys().then((keys) =>
       Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))
-    )
+    ).then(() => self.clients.claim())
   );
-  self.clients.claim();
 });
 
-// Network-first for the app shell so updates show up without a stale cache
-// (same pattern used in your other PWAs to avoid the "old version stuck" bug)
+// Network-first, and critically: {cache:'no-store'} bypasses the browser's
+// own HTTP cache too, not just the service worker's. Without this, the
+// browser can silently serve a stale JS/CSS file even though the service
+// worker "asked" the network for a fresh one — which was forcing a manual
+// cache-clear after every update. This guarantees every load gets the
+// current files from GitHub Pages; the Cache API copy below is purely an
+// offline fallback, never a first choice.
 self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET') return;
   e.respondWith(
-    fetch(e.request)
+    fetch(e.request, { cache: 'no-store' })
       .then((res) => {
         const copy = res.clone();
         caches.open(CACHE).then((c) => c.put(e.request, copy));
