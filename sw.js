@@ -1,4 +1,4 @@
-const CACHE = 'pwagro-v3';
+const CACHE = 'pwagro-v5';
 const SHELL = [
   './index.html', './manifest.json', './css/styles.css',
   './js/core/services.js', './js/core/store.js', './js/core/notifications-biometric.js',
@@ -23,17 +23,18 @@ self.addEventListener('activate', (e) => {
   );
 });
 
-// Network-first, and critically: {cache:'no-store'} bypasses the browser's
-// own HTTP cache too, not just the service worker's. Without this, the
-// browser can silently serve a stale JS/CSS file even though the service
-// worker "asked" the network for a fresh one — which was forcing a manual
-// cache-clear after every update. This guarantees every load gets the
-// current files from GitHub Pages; the Cache API copy below is purely an
-// offline fallback, never a first choice.
+// Deliberately conservative after two rounds of browser-specific fetch()
+// quirks (navigation-mode requests, cross-origin CDN scripts): only
+// intercept same-origin GET requests, and always re-fetch with the plain
+// single-argument form — the one pattern that's safe for every request
+// type, navigation included. Firebase/CDN scripts are left completely
+// alone and handled natively by the browser.
 self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET') return;
+  if (new URL(e.request.url).origin !== self.location.origin) return;
+
   e.respondWith(
-    fetch(e.request, { cache: 'no-store' })
+    fetch(e.request)
       .then((res) => {
         const copy = res.clone();
         caches.open(CACHE).then((c) => c.put(e.request, copy));
