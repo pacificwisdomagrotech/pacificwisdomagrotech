@@ -152,6 +152,15 @@ class AuthController {
   _friendlyError(e){
     if(['auth/wrong-password','auth/user-not-found','auth/invalid-credential'].includes(e.code)) return 'Incorrect email or password.';
     if(e.code === 'auth/too-many-requests') return 'Too many attempts. Try again later.';
+    if(e.code === 'auth/invalid-email') return 'That email address doesn\'t look valid.';
+    // Google's identitytoolkit API now returns a consolidated
+    // INVALID_LOGIN_CREDENTIALS error (for both wrong password and unknown
+    // email) that this SDK version doesn't parse into a short e.code —
+    // it shows up as raw JSON in e.message instead. Catch that here so
+    // nobody ever sees server internals on the login screen.
+    if((e.message||'').includes('INVALID_LOGIN_CREDENTIALS') || (e.message||'').trim().startsWith('{')){
+      return 'Incorrect email or password.';
+    }
     return e.message;
   }
 }
